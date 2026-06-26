@@ -1,0 +1,520 @@
+import streamlit as st
+from geopy.geocoders import Nominatim
+import numpy as np
+from scipy.spatial import cKDTree
+import pandas as pd
+import re
+import unicodedata
+import os
+from databricks import sql
+
+# =========================================================
+# 1. CONFIGURAÇÃO DE PÁGINA E INJEÇÃO DE UX/UI (CSS)
+# =========================================================
+st.set_page_config(page_title="SCAE | Roteirizador Avançado",page_icon="💧", layout="centered")
+
+st.markdown("""
+    <style>
+        
+    /* Importação de Fonte Premium (Inter) */
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
+
+    html, body, [class*="css"] {
+        font-family: 'Inter', sans-serif;
+    }
+
+    /* Fundo da aplicação */
+    .stApp {
+        background-color: #F8FAFC;
+    }
+
+    /* Cabeçalho Customizado Aegea / Corsan */
+    .aegea-header {
+        background: linear-gradient(90deg, #003B70 0%, #006699 50%, #00A9E0 100%);
+        padding: 1.5rem;
+        border-radius: 12px;
+        color: white;
+        margin-bottom: 2rem;
+        box-shadow: 0 4px 15px rgba(0, 59, 112, 0.15);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+    .aegea-header h1 {
+        color: white !important;
+        margin: 0;
+        font-size: 1.5rem;
+        font-weight: 700;
+        letter-spacing: 0.5px;
+    }
+    .aegea-header span {
+        font-size: 0.9rem;
+        opacity: 0.9;
+        font-weight: 300;
+    }
+
+    /* Estilização do Formulário e Input */
+    .stTextInput > div > div > input {
+        border-radius: 8px;
+        border: 1px solid #CBD5E1;
+        padding: 0.75rem 1rem;
+        font-size: 1.1rem;
+        transition: all 0.2s ease;
+        background-color: #FFFFFF;
+    }
+    .stTextInput > div > div > input:focus {
+        border-color: #00A9E0;
+        box-shadow: 0 0 0 2px rgba(0, 169, 224, 0.2);
+    }
+
+    /* Botão Primário Arrojado */
+    .stButton > button {
+        background-color: #003B70;
+        color: white;
+        border-radius: 8px;
+        border: none;
+        padding: 0.6rem 1.5rem;
+        font-weight: 600;
+        width: 100%;
+        transition: all 0.3s ease;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+        font-size: 0.9rem;
+    }
+    .stButton > button:hover {
+        background-color: #00A9E0;
+        box-shadow: 0 6px 16px rgba(0, 169, 224, 0.3);
+        transform: translateY(-2px);
+        color: white;
+    }
+
+    /* Cards das Métricas (Design Neumórfico Suave) */
+    [data-testid="stMetric"] {
+        background-color: #FFFFFF;
+        padding: 1rem 1.2rem;
+        border-radius: 12px;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
+        border-left: 5px solid #00A9E0;
+        transition: transform 0.2s ease;
+    }
+    [data-testid="stMetric"]:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+    }
+    [data-testid="stMetricLabel"] {
+        font-weight: 600;
+        color: #64748B;
+        font-size: 0.85rem;
+        text-transform: uppercase;
+    }
+    [data-testid="stMetricValue"] {
+        color: #0F172A;
+        font-weight: 700;
+        font-size: 2rem;
+    }
+
+    /* Personalização da Barra Lateral */
+    [data-testid="stSidebar"] {
+        background-color: #FFFFFF;
+        border-right: 1px solid #E2E8F0;
+    }
+
+    /* Alertas e Caixas de Info mais elegantes */
+    .stAlert {
+        border-radius: 10px;
+        border: none;
+    }
+
+    /* Títulos Internos */
+    h3 {
+        color: #003B70 !important;
+        font-weight: 600;
+        font-size: 1.2rem;
+        margin-top: 1.5rem;
+        margin-bottom: 1rem;
+    }
+
+    /* Esconder ancoras de link nativas do Streamlit nos títulos */
+    .st-emotion-cache-10y5sf6 { display: none; }
+    </style>
+""", unsafe_allow_html=True)
+
+# Renderização do Cabeçalho Personalizado
+st.markdown("""
+    <div class="aegea-header">
+        <div>
+            <h1>AEGEA | CORSAN</h1>
+            <span>Roteirizador</span>
+        </div>
+        <div>
+            <span style="background: rgba(255,255,255,0.2); padding: 5px 10px; border-radius: 20px; font-weight: 600;">CADROTA</span>
+        </div>
+    </div>
+""", unsafe_allow_html=True)
+
+# Configurações de Conexão com o Databricks
+MEU_HOSTNAME = "adb-3362006351891743.3.azuredatabricks.net"
+MEU_HTTP_PATH = "/sql/1.0/warehouses/d962d79a77c99a20"
+TABELA_SKY = "aegea_corp_prd.db_bus_cadastro.vw_odi_rel_cad_indcom"
+
+
+def padronizar_rua(nome):
+    if pd.isna(nome): return ""
+    nome = ''.join(c for c in unicodedata.normalize('NFD', str(nome)) if unicodedata.category(c) != 'Mn')
+    nome = nome.upper()
+    for p in ['RUA ', 'AVENIDA ', 'AVENI ', 'AV. ', 'R. ', 'TRAVESSA ', 'TRAVE ', 'ESTRADA ', 'RODOVIA ', 'BECO ']:
+        nome = nome.replace(p, '')
+    return nome.strip()
+
+
+# =========================================================
+# FUNÇÃO DE INTELIGÊNCIA DE PARIDADE
+# =========================================================
+def aplicar_inteligencia_paridade(df_rua, num_alvo):
+    if num_alvo <= 0 or df_rua.empty: return df_rua, False
+    df_pares = df_rua[df_rua['numero'] % 2 == 0]
+    df_impares = df_rua[df_rua['numero'] % 2 != 0]
+    if df_pares.empty or df_impares.empty: return df_rua, False
+    is_alvo_par = (num_alvo % 2 == 0)
+    rotas_pares = set(df_pares['Rota Leitura'].dropna())
+    rotas_impares = set(df_impares['Rota Leitura'].dropna())
+    if not rotas_pares.intersection(rotas_impares):
+        return (df_pares if is_alvo_par else df_impares), True
+    shared_routes = rotas_pares.intersection(rotas_impares)
+    for rota in shared_routes:
+        seq_pares = df_pares[df_pares['Rota Leitura'] == rota]['Sequência de Leitura']
+        seq_impares = df_impares[df_impares['Rota Leitura'] == rota]['Sequência de Leitura']
+        if not seq_pares.empty and not seq_impares.empty:
+            if seq_pares.max() < seq_impares.min() or seq_impares.max() < seq_pares.min():
+                return (df_pares if is_alvo_par else df_impares), True
+    return df_rua, False
+
+
+@st.cache_resource(ttl=3600)
+def obter_conexao_databricks():
+    return sql.connect(server_hostname=MEU_HOSTNAME, http_path=MEU_HTTP_PATH, auth_type="databricks-oauth")
+
+
+# ==========================================
+# BARRA LATERAL UI
+# ==========================================
+with st.sidebar:
+    st.image("https://www.aegea.com.br/wp-content/uploads/2024/02/aegea.svg",
+             width=150)
+    st.title("Configurações")
+    st.markdown("**Status da Malha:** Online")
+    st.markdown("**Filtros Ativos:**")
+    st.caption("✓ Paridade Inteligente\n\n✓ Sentido de Rota Bidirecional\n\n✓ Cascata Espacial")
+    st.markdown("---")
+    if st.button("Limpar Cache de Memória"):
+        st.cache_resource.clear()
+        st.rerun()
+
+
+# ==========================================
+# MOTOR DE LEITURA (ATUALIZADO)
+# ==========================================
+@st.cache_resource(show_spinner=False)
+def carregar_malha_cidade(cidade_alvo):
+    try:
+        conexao = obter_conexao_databricks()
+        cursor = conexao.cursor()
+        query = f"""
+            SELECT NUM_LIGACAO, SIT_LIGACAO, TRIM(END_LIGACAO) AS Endereco_da_Instalacao,
+                   TRIM(NOM_LOGRADOURO) AS Nome_Logradouro, NRO as numero, TRIM(NOM_BAIRRO) AS Bairro,
+                   CIDADE as Localidade, ROUND(COD_LATITUDE, 5) AS Latitude, ROUND(COD_LONGITUDE, 5) AS Longitude,
+                   COD_SETOR_COMERCIAL as Setor_Comercial, NUM_QUADRA as Quadra, NUM_LOTE as Lote,
+                   COD_GRUPO as Grupo, COD_ROTA_LEITURA as Rota_Leitura, SEQ_ROTA as Sequencia_de_Leitura
+            FROM {TABELA_SKY}
+            WHERE EMP_CODIGO = 59 AND ULTIMO_CONTRATO = 'SIM' AND REFERENCIA = DATE ('2026-05-01')
+              AND CIDADE = '{cidade_alvo}' AND COD_GRUPO > 0 AND COD_LATITUDE IS NOT NULL AND COD_LONGITUDE IS NOT NULL
+        """
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        cols = [desc[0] for desc in cursor.description]
+        df_cidade = pd.DataFrame(rows, columns=cols)
+        cursor.close()
+
+        if df_cidade.empty: return pd.DataFrame()
+
+        df_cidade = df_cidade.rename(columns={
+            'NUM_LIGACAO': 'N° da Ligação', 'SIT_LIGACAO': 'Situação da Ligação',
+            'Endereco_da_Instalacao': 'Endereço da Instalação', 'Setor_Comercial': 'Setor Comercial',
+            'Rota_Leitura': 'Rota Leitura', 'Sequencia_de_Leitura': 'Sequência de Leitura',
+            'Nome_Logradouro': 'Nome Logradouro'
+        })
+
+        # INCLUSÃO DAS SITUAÇÕES DE LIGAÇÃO CORTADA/SUPRIMIDA NO FILTRO
+        status_validos = [
+            'ATIVA', 'LIGADA', 'LIGADO', 'ATIVO',
+            'CORTADA', 'CORTADO', 'SUPRIMIDA', 'SUPRIMIDO'
+        ]
+        df_cidade = df_cidade[df_cidade['Situação da Ligação'].astype(str).str.strip().str.upper().isin(status_validos)]
+
+        df_cidade['numero'] = pd.to_numeric(df_cidade['numero'], errors='coerce').fillna(0).astype(int)
+        df_cidade['Latitude'] = pd.to_numeric(df_cidade['Latitude'].astype(str).str.replace(',', '.'), errors='coerce')
+        df_cidade['Longitude'] = pd.to_numeric(df_cidade['Longitude'].astype(str).str.replace(',', '.'),
+                                               errors='coerce')
+        df_cidade = df_cidade.dropna(subset=['Latitude', 'Longitude'])
+        df_cidade['Rua_Busca'] = df_cidade['Nome Logradouro'].apply(padronizar_rua)
+
+        if df_cidade['Rua_Busca'].str.strip().eq("").all():
+            df_cidade['Rua_Busca'] = df_cidade['Endereço da Instalação'].apply(padronizar_rua)
+
+        return df_cidade
+    except Exception as e:
+        st.error(f"Erro ao ler malha: {e}")
+        return pd.DataFrame()
+
+
+geolocator = Nominatim(user_agent="scae_commercial_validator_v28")
+
+with st.form(key="form_roteirizacao", border=False):
+    st.markdown("<p style='color: #64748B; font-weight: 600; margin-bottom: 0;'>INSERIR MATRÍCULA</p>",
+                unsafe_allow_html=True)
+    matricula_digitada = st.text_input(
+        "",
+        placeholder="Digite o número da matrícula do novo cliente. Ex: 87654321",
+        label_visibility="collapsed"
+    )
+    st.write("")  # Espaçamento
+    botao_sugerir = st.form_submit_button("Roteirizar")
+
+if botao_sugerir:
+    if not matricula_digitada.strip():
+        st.warning("Por favor, insira uma matrícula válida.")
+    else:
+        with st.spinner("Aguarde..."):
+            try:
+                conexao = obter_conexao_databricks()
+                cursor = conexao.cursor()
+                query_alvo = f"""
+                    SELECT TRIM(END_LIGACAO), TRIM(NOM_LOGRADOURO), TRIM(NOM_BAIRRO), COD_LATITUDE, COD_LONGITUDE, CIDADE 
+                    FROM {TABELA_SKY} 
+                    WHERE NUM_LIGACAO = '{matricula_digitada.strip()}' AND EMP_CODIGO = 59
+                    ORDER BY REFERENCIA DESC LIMIT 1
+                """
+                cursor.execute(query_alvo)
+                resultado_sky = cursor.fetchone()
+                cursor.close()
+
+                if not resultado_sky:
+                    st.error(f"Matrícula {matricula_digitada} não localizada na empresa.")
+                    st.stop()
+
+                endereco_alvo, logradouro_alvo, bairro_alvo, lat_nova, lon_nova, cidade_selecionada = resultado_sky
+                try:
+                    lat_nova = float(str(lat_nova).replace(',', '.')) if lat_nova else 0.0
+                    lon_nova = float(str(lon_nova).replace(',', '.')) if lon_nova else 0.0
+                except:
+                    lat_nova, lon_nova = 0.0, 0.0
+            except Exception as e:
+                st.error(f"Falha no banco: {str(e)}")
+                st.stop()
+
+        with st.spinner(f"Estruturando dados de {cidade_selecionada}..."):
+            df_cidade = carregar_malha_cidade(cidade_selecionada)
+            if df_cidade.empty:
+                st.error("Falha ao carregar malha histórica.")
+                st.stop()
+
+        df_cidade_ancoras = df_cidade[df_cidade['N° da Ligação'].astype(str) != matricula_digitada.strip()]
+        rua_busca_alvo = padronizar_rua(logradouro_alvo if logradouro_alvo else endereco_alvo)
+        try:
+            num_alvo = int(re.search(r'\d+', str(endereco_alvo).split(',')[1]).group()) if len(
+                str(endereco_alvo).split(',')) > 1 else 0
+        except:
+            num_alvo = 0
+
+        origem_coordenada = "SCAE Databricks (Cadastro Original)"
+
+        with st.spinner("Validando coordenadas..."):
+            if lat_nova >= 0 or lon_nova >= 0 or lat_nova == 0.0 or pd.isna(lat_nova):
+                df_heranca_rua = df_cidade_ancoras[df_cidade_ancoras['Rua_Busca'] == rua_busca_alvo]
+                df_heranca_bairro = df_cidade_ancoras[
+                    df_cidade_ancoras['Bairro'] == bairro_alvo] if bairro_alvo else pd.DataFrame()
+
+                if not df_heranca_rua.empty:
+                    df_heranca_rua_filtrada, paridade_ativa = aplicar_inteligencia_paridade(df_heranca_rua, num_alvo)
+                    df_heranca_rua_filtrada = df_heranca_rua_filtrada.copy()
+                    df_heranca_rua_filtrada['dist_num'] = (df_heranca_rua_filtrada['numero'] - num_alvo).abs()
+                    vizinho_heranca = df_heranca_rua_filtrada.sort_values(by='dist_num').iloc[0]
+                    lat_nova, lon_nova = vizinho_heranca['Latitude'], vizinho_heranca['Longitude']
+                    texto_paridade = " no Lado Correto da Via" if paridade_ativa else ""
+                    origem_coordenada = f"Herdada da Malha (Mesma Rua{texto_paridade})"
+
+                elif not df_heranca_bairro.empty:
+                    df_heranca_bairro = df_heranca_bairro.copy()
+                    df_heranca_bairro['dist_num'] = (df_heranca_bairro['numero'] - num_alvo).abs()
+                    vizinho_heranca = df_heranca_bairro.sort_values(by='dist_num').iloc[0]
+                    lat_nova, lon_nova = vizinho_heranca['Latitude'], vizinho_heranca['Longitude']
+                    origem_coordenada = "Herdada da Malha (Mesmo Bairro)"
+
+                else:
+                    localizacao_encontrada = False
+                    try:
+                        tentativas_busca = [
+                            f"{logradouro_alvo if logradouro_alvo else endereco_alvo}, {bairro_alvo}, {cidade_selecionada}, RS, Brasil",
+                            f"{bairro_alvo}, {cidade_selecionada}, RS, Brasil",
+                            f"{cidade_selecionada}, RS, Brasil"
+                        ]
+                        for busca in tentativas_busca:
+                            if len(busca.replace(', ', '').strip()) > 15:
+                                localizacao = geolocator.geocode(busca, timeout=10)
+                                if localizacao:
+                                    lat_nova, lon_nova = localizacao.latitude, localizacao.longitude
+                                    origem_coordenada = "API de Mapas Externa"
+                                    localizacao_encontrada = True
+                                    break
+                    except:
+                        pass
+
+                    if not localizacao_encontrada:
+                        lat_nova, lon_nova = df_cidade_ancoras['Latitude'].median(), df_cidade_ancoras[
+                            'Longitude'].median()
+                        origem_coordenada = "Centro de Massa Geográfico"
+
+        with st.spinner("Processando árvore de decisão espacial..."):
+            try:
+                df_mesmo_local = df_cidade_ancoras[(df_cidade_ancoras['Rua_Busca'] == rua_busca_alvo) & (
+                            df_cidade_ancoras['numero'] == num_alvo)] if num_alvo > 0 else pd.DataFrame()
+
+                if not df_mesmo_local.empty:
+                    vizinho = df_mesmo_local.iloc[0]
+                    tipo_ancoragem = "Duplicidade Predial Identificada (Mesmo Lote)"
+                else:
+                    df_filtrado = df_cidade_ancoras[df_cidade_ancoras['Rua_Busca'] == rua_busca_alvo]
+                    tipo_ancoragem = "Busca Espacial na Mesma Rua"
+
+                    if not df_filtrado.empty:
+                        df_filtrado, paridade_ativa = aplicar_inteligencia_paridade(df_filtrado, num_alvo)
+                        if paridade_ativa: tipo_ancoragem += " (Paridade de Via Ativada)"
+
+                    if df_filtrado.empty and bairro_alvo:
+                        df_filtrado = df_cidade_ancoras[df_cidade_ancoras['Bairro'] == bairro_alvo]
+                        tipo_ancoragem = "Alocação por Padrão de Bairro"
+                    if df_filtrado.empty:
+                        df_filtrado = df_cidade_ancoras
+                        tipo_ancoragem = "Alocação por Proximidade Geral"
+
+                    arvore_espacial = cKDTree(df_filtrado[['Latitude', 'Longitude']].values)
+                    _, indice_vizinho = arvore_espacial.query([lat_nova, lon_nova], k=1)
+                    vizinho = df_filtrado.iloc[indice_vizinho]
+
+                grupo, rota, sequencia_vizinho = int(vizinho["Grupo"]), vizinho["Rota Leitura"], vizinho[
+                    "Sequência de Leitura"]
+                numero_vizinho = int(vizinho['numero'])
+                setor_comercial, quadra, lote = vizinho.get("Setor Comercial", "N/A"), vizinho.get("Quadra",
+                                                                                                   "N/A"), vizinho.get(
+                    "Lote", "N/A")
+
+                vizinhos_rota = df_cidade[
+                    (df_cidade['Grupo'] == grupo) & (df_cidade['Rota Leitura'] == rota)].sort_values(
+                    by='Sequência de Leitura')
+                proximos = vizinhos_rota[vizinhos_rota['Sequência de Leitura'] > sequencia_vizinho]
+                prox_vizinho = proximos.iloc[0] if not proximos.empty else None
+                anteriores = vizinhos_rota[vizinhos_rota['Sequência de Leitura'] < sequencia_vizinho]
+                ant_vizinho = anteriores.iloc[-1] if not anteriores.empty else None
+
+                info_espacamento, requer_resequenciamento, sentido_avanco = "", False, True
+
+                if numero_vizinho == num_alvo and num_alvo != 0:
+                    sequencia_sugerida = int(sequencia_vizinho + 1)
+                    info_espacamento = "Imóvel sobreposto. Incremento exato (+1) gerado."
+                else:
+                    if num_alvo > 0 and numero_vizinho > 0 and prox_vizinho is not None and ant_vizinho is not None:
+                        num_prox, num_ant = int(prox_vizinho['numero']), int(ant_vizinho['numero'])
+                        if num_alvo > numero_vizinho:
+                            if num_prox > numero_vizinho:
+                                sentido_avanco = True
+                            elif num_ant > numero_vizinho:
+                                sentido_avanco = False
+                        elif num_alvo < numero_vizinho:
+                            if num_prox < numero_vizinho:
+                                sentido_avanco = True
+                            elif num_ant < numero_vizinho:
+                                sentido_avanco = False
+
+                    if sentido_avanco:
+                        if prox_vizinho is not None:
+                            gap = prox_vizinho['Sequência de Leitura'] - sequencia_vizinho
+                            if gap >= 10:
+                                incremento, info_espacamento = 5, f"Avanço: Janela livre de {int(gap)} pos. Inserção balanceada."
+                            elif gap > 1:
+                                incremento, info_espacamento = max(1,
+                                                                   int(gap / 2)), f"Avanço: Janela estreita de {int(gap)} pos."
+                            else:
+                                incremento, requer_resequenciamento, info_espacamento = 1, True, "Rotas Coladas à frente. Requer remanejo no SCAE."
+                            sequencia_sugerida = int(sequencia_vizinho + incremento)
+                        else:
+                            sequencia_sugerida, info_espacamento = int(
+                                sequencia_vizinho + 5), "Final de linha da rota (+5)."
+                    else:
+                        if ant_vizinho is not None:
+                            gap = sequencia_vizinho - ant_vizinho['Sequência de Leitura']
+                            if gap >= 10:
+                                decremento, info_espacamento = 5, f"Recuo: Janela livre de {int(gap)} pos. Inserção balanceada."
+                            elif gap > 1:
+                                decremento, info_espacamento = max(1,
+                                                                   int(gap / 2)), f"Recuo: Janela estreita de {int(gap)} pos."
+                            else:
+                                decremento, requer_resequenciamento, info_espacamento = 1, True, "Rotas Coladas atrás. Requer remanejo no SCAE."
+                            sequencia_sugerida = max(1, int(sequencia_vizinho - decremento))
+                        else:
+                            sequencia_sugerida, info_espacamento = max(1,
+                                                                       int(sequencia_vizinho - 5)), "Início de linha da rota (-5)."
+
+                # Renderização Final Clean UI
+                st.success(f"Matrícula **{matricula_digitada}** roteirizada com sucesso.")
+
+                st.markdown("### Resultados Operacionais")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Grupo Sugerido", f"{grupo}")
+                c2.metric("Rota Sugerida", f"{rota:02d}" if isinstance(rota, (int, float)) else f"{rota}")
+
+                d_sign = '-' if not sentido_avanco and numero_vizinho != num_alvo else '+'
+                d_val = abs(sequencia_sugerida - sequencia_vizinho)
+                c3.metric("Sequência de Leitura", f"{sequencia_sugerida}", delta=f"{d_sign}{d_val} Posições",
+                          delta_color="inverse" if requer_resequenciamento else "normal")
+
+                st.markdown("### Segmentação Territorial Herdada")
+                c4, c5, c6 = st.columns(3)
+                c4.metric("Setor Comercial", f"{setor_comercial}")
+                c5.metric("Quadra", f"{quadra}")
+                c6.metric("Lote", f"{lote}")
+
+                st.markdown("---")
+
+                st.info(f"Inteligência de Paginação: {info_espacamento}")
+
+                if numero_vizinho == num_alvo and num_alvo != 0:
+                    st.warning(f"Alerta de duplicidade predial: O número {num_alvo} já possui outra ligação ATIVA "
+                               f"N° {vizinho.get('N° da Ligação', 'Desconhecido')}. Confirmada a regra de sequenciamento colado (+1).")
+                elif requer_resequenciamento:
+                    st.warning(
+                        "Re-sequenciamento mandatório: Não existem índices vagos nesta janela. Será necessário realizar o remanejamento manual da sequência de leitura desta rota no sistema.")
+
+                # Exibição vertical e direta dos endereços para análise operacional de proximidade
+                st.markdown(f"**Endereço Registrado no SCAE (Alvo):** {endereco_alvo}")
+                endereco_vizinho = f"{vizinho['Endereço da Instalação']}, {vizinho['numero']}"
+                st.markdown(f"**Endereço do Vizinho Seguro (Âncora):** {endereco_vizinho} - Sequência Base: {sequencia_vizinho}")
+
+                st.caption(
+                    f"**Motor Geográfico:** {tipo_ancoragem} | **Paginação:** {info_espacamento} | **Fonte GPS:** {origem_coordenada}")
+
+                st.markdown("---")
+                st.markdown("**Legenda do Mapa:** Azul (Matrícula Alvo) | Verde (Âncora Espacial)")
+
+                # MAPA CUSTOMIZADO: Valores de raio restritos ao lote predial com opacidade alpha aplicada
+                df_mapa = pd.DataFrame([
+                    {"lat": lat_nova, "lon": lon_nova, "cor": "#00A9E088", "tamanho": 12},       # Azul translúcido
+                    {"lat": vizinho["Latitude"], "lon": vizinho["Longitude"], "cor": "#4CAF5088", "tamanho": 6} # Verde translúcido
+                ])
+
+                try:
+                    st.map(df_mapa, latitude="lat", longitude="lon", color="cor", size="tamanho", zoom=17)
+                except:
+                    st.map(df_mapa[["lat", "lon"]], zoom=17)
+
+            except Exception as e:
+                st.error(f"Erro de processamento: {str(e)}")
